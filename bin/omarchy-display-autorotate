@@ -12,9 +12,15 @@
 set -uo pipefail
 
 LOCK="${XDG_RUNTIME_DIR:-/tmp}/omarchy-display-autorotate.lock"
+IIO_PATH="${OMARCHY_IIO_PATH:-/sys/bus/iio/devices}"
+POLL_INTERVAL="${OMARCHY_AUTOROTATE_POLL_INTERVAL:-0.5}"
+VERIFY_INTERVAL="${OMARCHY_AUTOROTATE_VERIFY_INTERVAL:-5}"
+TABLET_ANGLE=200
+TILT_THRESHOLD=7000
+AXIS_MARGIN=1500
+CONFIRM_SAMPLES=3
 
 omarchy-hw-accelerometer || exit 0
-omarchy-cmd-present monitor-sensor || exit 0
 
 # One reader per session. A second copy would claim the sensor for nothing and
 # race this one to apply the same transform. The lock is held on this process
@@ -24,6 +30,11 @@ flock -n 9 || exit 0
 
 sensor_pid=""
 sensor_fd=""
+raw_accelerometer=""
+lid_angle_sensor=""
+m00=1 m01=0 m02=0
+m10=0 m11=1 m12=0
+m20=0 m21=0 m22=1
 
 stop_sensor() {
   [[ -n $sensor_pid ]] || return 0
@@ -53,6 +64,51 @@ transform_for() {
     right-up) echo 3 ;;
     *) return 1 ;;
   esac
+}
+
+discover_convertible_sensors() {
+  local device label name matrix value
+
+  raw_accelerometer=""
+  lid_angle_sensor=""
+  m00=1 m01=0 m02=0
+  m10=0 m11=1 m12=0
+  m20=0 m21=0 m22=1
+
+  for device in "$IIO_PATH"/iio:device*; do
+    [[ -d $device ]] || continue
+    label=""
+    name=""
+    [[ -r $device/label ]] && label=$(<"$device/label")
+    [[ -r $device/name ]] && name=$(<"$device/name")
+
+    [[ $label == "accel-display" ]] && raw_accelerometer="$device"
+    [[ $name == "cros-ec-lid-angle" ]] && lid_angle_sensor="$device/in_angl_raw"
+  done
+
+  [[ -r $raw_accelerometer/in_accel_x_raw &&
+    -r $raw_accelerometer/in_accel_y_raw &&
+    -r $raw_accelerometer/in_accel_z_raw &&
+    -r $lid_angle_sensor ]] || return 1
+
+  matrix=$(udevadm info --query=property --path="$raw_accelerometer" 2>/dev/null |
+    sed -n 's/^ACCEL_MOUNT_MATRIX=//p')
+  if [[ -n $matrix ]]; then
+    matrix=${matrix//,/ }
+    matrix=${matrix//;/ }
+    read -r m00 m01 m02 m10 m11 m12 m20 m21 m22 <<<"$matrix"
+    for value in "$m00" "$m01" "$m02" "$m10" "$m11" "$m12" "$m20" "$m21" "$m22"; do
+      [[ $value =~ ^-?[01]$ ]] || return 1
+    done
+  fi
+}
+
+read_integer() {
+  local file="$1" value
+
+  value=$(<"$file") 2>/dev/null || return 1
+  [[ $value =~ ^-?[0-9]+$ ]] || return 1
+  printf '%s' "$value"
 }
 
 internal_monitor() {
@@ -85,28 +141,98 @@ apply_orientation() {
   omarchy-display-orientation "$transform" --monitor "$monitor" --transient >/dev/null || return 0
 }
 
+# Framework 12 exposes a display accelerometer and EC hinge angle directly,
+# while iio-sensor-proxy can select its unusable buffered interface and never
+# emit an orientation. Reading the labelled display sensor also lets laptop
+# mode stay upright instead of following accelerometer motion before the hinge
+# has folded around.
+read_convertible_sensor() {
+  local lid raw_x raw_y raw_z x y abs_x abs_y
+  local pending="" pending_count=0 applied="" verify_count=0 orientation
+
+  while true; do
+    lid=$(read_integer "$lid_angle_sensor") || return 1
+    if (( lid < TABLET_ANGLE )); then
+      orientation="normal"
+    else
+      raw_x=$(read_integer "$raw_accelerometer/in_accel_x_raw") || return 1
+      raw_y=$(read_integer "$raw_accelerometer/in_accel_y_raw") || return 1
+      raw_z=$(read_integer "$raw_accelerometer/in_accel_z_raw") || return 1
+
+      # IIO mount matrices transform a row vector: [raw x y z] * matrix.
+      x=$((raw_x * m00 + raw_y * m10 + raw_z * m20))
+      y=$((raw_x * m01 + raw_y * m11 + raw_z * m21))
+      abs_x=${x#-}
+      abs_y=${y#-}
+
+      if (( abs_x >= TILT_THRESHOLD && abs_x >= abs_y + AXIS_MARGIN )); then
+        (( x < 0 )) && orientation="left-up" || orientation="right-up"
+      elif (( abs_y >= TILT_THRESHOLD && abs_y >= abs_x + AXIS_MARGIN )); then
+        (( y < 0 )) && orientation="normal" || orientation="bottom-up"
+      else
+        pending=""
+        pending_count=0
+        sleep "$POLL_INTERVAL"
+        continue
+      fi
+    fi
+
+    if [[ $orientation != "$pending" ]]; then
+      pending="$orientation"
+      pending_count=1
+      verify_count=0
+    else
+      (( pending_count < CONFIRM_SAMPLES )) && ((pending_count += 1))
+      if (( pending_count >= CONFIRM_SAMPLES )); then
+        ((verify_count += 1))
+        if omarchy-toggle-enabled rotate-lock; then
+          # Keep the applied marker empty so unlocking reacts on the next
+          # stable sample rather than waiting for the verification interval.
+          applied=""
+        elif [[ $orientation != "$applied" ]] || (( verify_count >= 20 )); then
+          apply_orientation "$orientation"
+          applied="$orientation"
+          verify_count=0
+        fi
+      fi
+    fi
+
+    sleep "$POLL_INTERVAL"
+  done
+}
+
 # monitor-sensor announces the orientation it starts with, then one line per
 # change. Leading whitespace and the `===`/`+++` prefixes vary by version, so
 # match on the phrase rather than the shape of the line.
 read_sensor() {
-  local line orientation
+  local line orientation=""
+
+  omarchy-cmd-present monitor-sensor || return 1
 
   # Opened onto a descriptor rather than read from inline, so the reader's pid
   # is knowable and the loop still runs in this shell.
   exec {sensor_fd}< <(monitor-sensor --accel 2>/dev/null)
   sensor_pid=$!
 
-  while read -r line <&"$sensor_fd"; do
-    case "$line" in
-      *"Accelerometer orientation changed: "*) orientation="${line##*: }" ;;
-      *"Has accelerometer (orientation: "*)
-        orientation="${line##*orientation: }"
-        orientation="${orientation%)}"
-        ;;
-      *) continue ;;
-    esac
+  while true; do
+    if read -r -t "$VERIFY_INTERVAL" line <&"$sensor_fd"; then
+      case "$line" in
+        *"Accelerometer orientation changed: "*) orientation="${line##*: }" ;;
+        *"Has accelerometer (orientation: "*)
+          orientation="${line##*orientation: }"
+          orientation="${orientation%)}"
+          ;;
+        *) continue ;;
+      esac
 
-    apply_orientation "$orientation"
+      apply_orientation "$orientation"
+    elif kill -0 "$sensor_pid" 2>/dev/null; then
+      # A reload drops transient monitor and input rules without causing a new
+      # sensor event. Periodically replay the last orientation to repair them.
+      [[ -n $orientation ]] && apply_orientation "$orientation"
+    else
+      break
+    fi
   done
 
   exec {sensor_fd}<&-
@@ -118,7 +244,11 @@ read_sensor() {
 # daemon does appear.
 delay=1
 while true; do
-  read_sensor
+  if discover_convertible_sensors; then
+    read_convertible_sensor
+  else
+    read_sensor
+  fi
   sleep "$delay"
   (( delay = delay * 2 > 30 ? 30 : delay * 2 ))
 done
