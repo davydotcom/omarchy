@@ -18,7 +18,7 @@ cat >"$stub_bin/hyprctl" <<'SH'
 #!/bin/bash
 
 if [[ $1 == "monitors" && $2 == "all" && $3 == "-j" ]]; then
-  printf '[{"name":"eDP-1","focused":true,"transform":%s},{"name":"DP-2","focused":false,"transform":0}]' \
+  printf '[{"name":"eDP-1","focused":true,"transform":%s,"width":1920,"height":1200,"refreshRate":60.002,"x":0,"y":0,"scale":1.25},{"name":"DP-2","focused":false,"transform":0,"width":2560,"height":1440,"refreshRate":59.95,"x":1536,"y":0,"scale":1}]' \
     "${OMARCHY_TEST_TRANSFORM:-0}"
 elif [[ $1 == "devices" && $2 == "-j" ]]; then
   printf '{"touch":[{"name":"%s"}],"tablets":[]}' "${OMARCHY_TEST_TOUCH_DEVICE:-}"
@@ -87,17 +87,17 @@ pass "orientation names a flipped display"
 output=$(OMARCHY_TEST_TRANSFORM=0 orientation 90)
 [[ $output == "90" ]] || fail "orientation echoes the rotation it applied" "actual: $output"
 assert_eval_contains "orientation rotates the focused display" \
-  'hl.monitor({ output = "eDP-1", transform = 1 })'
+  'hl.monitor({ output = "eDP-1", mode = "1920x1200@60.002", position = "0x0", scale = 1.25, transform = 1 })'
 [[ -f $state_dir/monitor-eDP-1-transform.lua ]] ||
   fail "orientation persists the rotation for the next login"
-grep -qF 'hl.monitor({ output = "eDP-1", transform = 1 })' "$state_dir/monitor-eDP-1-transform.lua" ||
+grep -qF 'hl.monitor({ output = "eDP-1", mode = "1920x1200@60.002", position = "0x0", scale = 1.25, transform = 1 })' "$state_dir/monitor-eDP-1-transform.lua" ||
   fail "orientation persists the rotation it applied"
 pass "orientation persists the rotation for the next login"
 
 # left/right are what wlr-randr and sway users already type.
 OMARCHY_TEST_TRANSFORM=0 orientation right >/dev/null
 assert_eval_contains "orientation accepts the sway rotation names" \
-  'hl.monitor({ output = "eDP-1", transform = 3 })'
+  'hl.monitor({ output = "eDP-1", mode = "1920x1200@60.002", position = "0x0", scale = 1.25, transform = 3 })'
 
 # Back to normal drops the override entirely, so monitors.lua speaks again.
 OMARCHY_TEST_TRANSFORM=1 orientation normal >/dev/null
@@ -136,7 +136,7 @@ assert_eval_missing "orientation leaves touch input alone on external displays" 
 rm -f "$state_dir/monitor-eDP-1-transform.lua"
 OMARCHY_TEST_TRANSFORM=0 orientation 180 --transient >/dev/null
 assert_eval_contains "orientation applies a transient rotation" \
-  'hl.monitor({ output = "eDP-1", transform = 2 })'
+  'hl.monitor({ output = "eDP-1", mode = "1920x1200@60.002", position = "0x0", scale = 1.25, transform = 2 })'
 [[ ! -f $state_dir/monitor-eDP-1-transform.lua ]] ||
   fail "orientation does not persist a transient rotation"
 pass "orientation does not persist a transient rotation"
