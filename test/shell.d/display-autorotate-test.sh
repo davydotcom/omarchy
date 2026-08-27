@@ -84,6 +84,12 @@ SH
 # The sensor stream the daemon reads, replayed verbatim from monitor-sensor.
 cat >"$stub_bin/monitor-sensor" <<'SH'
 #!/bin/bash
+if [[ ${OMARCHY_TEST_STATIC_SENSOR:-false} == "true" ]]; then
+  echo '=== Has accelerometer (orientation: left-up)'
+  sleep 10
+  exit 0
+fi
+
 cat <<'OUT'
     Waiting for iio-sensor-proxy to appear
 +++ iio-sensor-proxy appeared
@@ -118,6 +124,7 @@ autorotate() {
   HOME="$home_dir" \
     XDG_RUNTIME_DIR="$runtime_dir" \
     OMARCHY_TEST_ROTATE_LOG="$rotate_log" \
+    OMARCHY_IIO_PATH="$iio_dir" \
     PATH="$stub_bin:$PATH" \
     bash "$ROOT/bin/omarchy-display-autorotate" >/dev/null 2>&1 &
   pid=$!
@@ -169,6 +176,49 @@ autorotate 0
   fail "autorotate leaves a disabled panel alone" "actual:"$'\n'"$(cat "$rotate_log")"
 pass "autorotate leaves a disabled panel alone"
 unset OMARCHY_TEST_INTERNAL_ENABLED
+
+# Transient rules disappear on a Hyprland reload, which does not itself make
+# monitor-sensor emit another event. Replaying the last reading repairs both
+# the panel and input transforms without waiting for the laptop to move.
+OMARCHY_TEST_STATIC_SENSOR=true
+OMARCHY_AUTOROTATE_VERIFY_INTERVAL=0.1
+export OMARCHY_TEST_STATIC_SENSOR OMARCHY_AUTOROTATE_VERIFY_INTERVAL
+autorotate 2
+(( $(grep -c '^1 --monitor eDP-1 --transient$' "$rotate_log") >= 2 )) ||
+  fail "autorotate reapplies the current orientation after a compositor reload"
+pass "autorotate periodically verifies the current orientation"
+unset OMARCHY_TEST_STATIC_SENSOR OMARCHY_AUTOROTATE_VERIFY_INTERVAL
+
+# Framework 12 exposes a labelled display accelerometer and a hinge-angle
+# sensor, but monitor-sensor can remain silent when iio-sensor-proxy selects the
+# device's unusable buffered interface. The direct reader is the fallback.
+framework_accel="$iio_dir/iio:device3"
+framework_lid="$iio_dir/iio:device4"
+mkdir -p "$framework_accel" "$framework_lid"
+echo accel-display >"$framework_accel/label"
+echo cros-ec-accel >"$framework_accel/name"
+echo -10000 >"$framework_accel/in_accel_x_raw"
+echo 0 >"$framework_accel/in_accel_y_raw"
+echo 0 >"$framework_accel/in_accel_z_raw"
+echo cros-ec-lid-angle >"$framework_lid/name"
+echo 500 >"$framework_lid/in_angl_raw"
+
+OMARCHY_AUTOROTATE_POLL_INTERVAL=0.02
+export OMARCHY_AUTOROTATE_POLL_INTERVAL
+autorotate 1
+[[ $(cat "$rotate_log") == '1 --monitor eDP-1 --transient' ]] ||
+  fail "autorotate reads the Framework display sensor directly" \
+    "actual:"$'\n'"$(cat "$rotate_log")"
+pass "autorotate falls back to the Framework display sensor"
+
+echo 113 >"$framework_lid/in_angl_raw"
+autorotate 1
+[[ $(cat "$rotate_log") == '0 --monitor eDP-1 --transient' ]] ||
+  fail "autorotate restores normal orientation in Framework laptop mode" \
+    "actual:"$'\n'"$(cat "$rotate_log")"
+pass "autorotate gates rotation on the Framework hinge angle"
+unset OMARCHY_AUTOROTATE_POLL_INTERVAL
+rm -rf "$framework_accel" "$framework_lid"
 
 autorotate 4
 for _ in {1..30}; do
