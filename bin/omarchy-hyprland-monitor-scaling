@@ -72,35 +72,42 @@ normalize_scale() {
 }
 
 # monitors.lua with its comments cut away, so a commented-out example can pose
-# neither as a rule nor as one of its keys. The file ships with several.
+# neither as a rule nor as one of its keys. The file ships with several. Each
+# hl.monitor call then gets a line of its own, however it was wrapped.
 monitor_rules() {
   local monitor_lua="$1"
 
   [[ -f $monitor_lua ]] || return 0
-  sed -E -e 's/--\[\[[^]]*\]\]//g' -e 's/--.*$//' "$monitor_lua"
+  sed -E -e 's/--\[\[[^]]*\]\]//g' -e 's/--.*$//' "$monitor_lua" |
+    tr '\n' ' ' |
+    sed -E -e 's/hl\.monitor[[:space:]]*\(/\nhl.monitor(/g' -e 's/\}[[:space:]]*\)/})\n/g'
 }
 
-# The scale set by a monitor's own hl.monitor rule, if it has one. Empty when
-# the monitor has no rule of its own or its rule names no scale, which is when
-# the catch-all rule governs it instead. A key is preceded by a table separator
-# so a longer key cannot stand in for it.
-monitor_rule_scale() {
+# The hl.monitor rules naming this monitor as their output.
+monitor_own_rules() {
   local monitor_lua="$1" output="$2"
 
   monitor_rules "$monitor_lua" |
-    sed -nE '/^[[:space:]]*hl\.monitor\(\{.*output[[:space:]]*=[[:space:]]*"'"$output"'"/ {
-      s/.*[{,;[:space:]]scale[[:space:]]*=[[:space:]]*("[^"]*"|[^,;}[:space:]]+).*/\1/p
-    }' | head -1
+    grep -E '^hl\.monitor\([[:space:]]*\{.*output[[:space:]]*=[[:space:]]*"'"$output"'"'
+}
+
+# The scale a monitor's own rules set. Hyprland merges every rule for an output,
+# so the last one naming a scale wins. A key is preceded by a table separator
+# so a longer key cannot stand in for it.
+monitor_rule_scale() {
+  monitor_own_rules "$1" "$2" |
+    sed -nE 's/.*[{,;[:space:]]scale[[:space:]]*=[[:space:]]*("[^"]*"|[^,;}[:space:]]+).*/\1/p' | tail -1
 }
 
 # Whether writing the shipped locals and catch-all reaches this monitor at all.
-# A rule of its own overrides them, unless that rule defers to the local by
-# name, as the shipped `scale = omarchy_monitor_scale` does.
+# A rule of its own replaces the catch-all outright, even one naming no scale,
+# unless its scale defers to the local by name, as the shipped
+# `scale = omarchy_monitor_scale` does.
 persisting_governs_monitor() {
-  local monitor_lua="$1" output="$2" rule_scale
+  local monitor_lua="$1" output="$2"
 
-  rule_scale=$(monitor_rule_scale "$monitor_lua" "$output")
-  [[ -z $rule_scale || $rule_scale == "omarchy_monitor_scale" ]]
+  [[ -z $(monitor_own_rules "$monitor_lua" "$output") ]] ||
+    [[ $(monitor_rule_scale "$monitor_lua" "$output") == "omarchy_monitor_scale" ]]
 }
 
 set_scale() {

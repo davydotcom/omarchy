@@ -203,14 +203,70 @@ grep -Fx 'local omarchy_monitor_scale = 1.6' "$monitor_lua" >/dev/null ||
   fail "monitor scaling ignores a commented-out rule"
 pass "monitor scaling ignores a commented-out rule"
 
-# A rule naming no scale at all leaves the catch-all governing the scale.
+# A rule naming no scale still replaces the catch-all for its monitor, which
+# then takes Hyprland's default scale rather than the local.
 cat >"$monitor_lua" <<'LUA'
 local omarchy_gdk_scale = 2
 local omarchy_monitor_scale = 2
 
+hl.monitor({ output = "", mode = "preferred", position = "auto", scale = omarchy_monitor_scale })
 hl.monitor({ output = "eDP-1", mode = "preferred", position = "auto", transform = 3 })
 LUA
+before=$(cat "$monitor_lua")
+OMARCHY_TEST_MONITOR_SCALE=2 run_scaling 1.6 2>/dev/null
+[[ $(cat "$monitor_lua") == "$before" ]] ||
+  fail "monitor scaling leaves monitors.lua alone when the monitor's rule names no scale"
+pass "monitor scaling leaves monitors.lua alone when the monitor's rule names no scale"
+
+# Hyprland merges every rule for an output, so the last scale named governs.
+write_merged_rules_config() {
+  cat >"$monitor_lua" <<LUA
+local omarchy_gdk_scale = 2
+local omarchy_monitor_scale = 2
+
+hl.monitor({ output = "", mode = "preferred", position = "auto", scale = omarchy_monitor_scale })
+hl.monitor({ output = "eDP-1", mode = "preferred", position = "auto", scale = $1 })
+hl.monitor({ output = "eDP-1", transform = 3, scale = $2 })
+LUA
+}
+
+write_merged_rules_config 1 omarchy_monitor_scale
 OMARCHY_TEST_MONITOR_SCALE=2 run_scaling 1.6
 grep -Fx 'local omarchy_monitor_scale = 1.6' "$monitor_lua" >/dev/null ||
-  fail "monitor scaling persists when the monitor's rule names no scale"
-pass "monitor scaling persists when the monitor's rule names no scale"
+  fail "monitor scaling persists when the last of the monitor's rules defers to the local"
+pass "monitor scaling persists when the last of the monitor's rules defers to the local"
+
+write_merged_rules_config omarchy_monitor_scale 1
+before=$(cat "$monitor_lua")
+OMARCHY_TEST_MONITOR_SCALE=2 run_scaling 1.6 2>/dev/null
+[[ $(cat "$monitor_lua") == "$before" ]] ||
+  fail "monitor scaling leaves monitors.lua alone when a later rule overrides the local"
+pass "monitor scaling leaves monitors.lua alone when a later rule overrides the local"
+
+# A rule wrapped over several lines is read as one.
+write_wrapped_rule_config() {
+  cat >"$monitor_lua" <<LUA
+local omarchy_gdk_scale = 2
+local omarchy_monitor_scale = 2
+
+hl.monitor({ output = "", mode = "preferred", position = "auto", scale = omarchy_monitor_scale })
+hl.monitor({
+  output = "eDP-1",
+  scale = $1,
+  transform = 3,
+})
+LUA
+}
+
+write_wrapped_rule_config omarchy_monitor_scale
+OMARCHY_TEST_MONITOR_SCALE=2 run_scaling 1.6
+grep -Fx 'local omarchy_monitor_scale = 1.6' "$monitor_lua" >/dev/null ||
+  fail "monitor scaling persists through a wrapped rule that defers to the local"
+pass "monitor scaling persists through a wrapped rule that defers to the local"
+
+write_wrapped_rule_config 1
+before=$(cat "$monitor_lua")
+OMARCHY_TEST_MONITOR_SCALE=2 run_scaling 1.6 2>/dev/null
+[[ $(cat "$monitor_lua") == "$before" ]] ||
+  fail "monitor scaling leaves monitors.lua alone when a wrapped rule sets its own scale"
+pass "monitor scaling leaves monitors.lua alone when a wrapped rule sets its own scale"
